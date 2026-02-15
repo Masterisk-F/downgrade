@@ -32,6 +32,10 @@ $(gettext "Options"):
   --latest        $(gettext "pick latest matching version")
   --oldest        $(gettext "pick oldest matching version")
   --prefer-cache  $(gettext "do not query ala if a matching package was found in cache")
+  --no-aur        $(gettext "disable AUR search")
+  --aur-only      $(gettext "only use AUR as source")
+  --aur-cache     <$(gettext "path")>
+                  $(gettext "directory to cache AUR git clones, defaults to") "~/.cache/downgrade/aur"
   --version       $(gettext "show downgrade version")
   -h, --help      $(gettext "show help script")
 
@@ -171,7 +175,7 @@ matches_name_version_filter() {
   # version: 2025.11.12.r15.g0eed3fe
   version_regex="[a-zA-Z0-9.]+"
   hash_or_minor="([0-9]+|[a-z0-9]{6,})"
-  pkg_version=$(sed -r "s/.*$name-($version_regex)(-$hash_or_minor)?-(any|$DOWNGRADE_ARCH)\\.(git)?pkg\\.tar\\.(gz|xz|zst)/\1\2/g" <<<"$pkg")
+  pkg_version=$(sed -r "s/.*$name-($version_regex)(-$hash_or_minor)?-(any|$DOWNGRADE_ARCH)\\.(git|aur)?pkg\\.tar\\.(gz|xz|zst)/\1\2/g" <<<"$pkg")
   cmp=$(vercmp "$pkg_version" "$search_version")
 
   case "$operator" in
@@ -225,6 +229,47 @@ search_git() {
     # shellcheck disable=SC2086
     echo "$path/$name" $pairs | awk '{for(i=2;i<NF;i+=2) printf "%s-%s-%s-any.gitpkg.tar.gz\n", $1, $(i+1), $i}' | sort -V
   done
+}
+
+search_aur() {
+  local name=$1 pairs repo_url repo_path aur_user
+
+  repo_url="https://aur.archlinux.org/${name}.git"
+  repo_path="${DOWNGRADE_AUR_CACHE}/${name}"
+  aur_user="${SUDO_USER:-$USER}"
+
+  mkdir -p "$DOWNGRADE_AUR_CACHE"
+  chown "$aur_user" "$DOWNGRADE_AUR_CACHE"
+
+  if [[ -d "$repo_path/.git" ]]; then
+    # Update existing clone
+    su "$aur_user" -c "git -C '$repo_path' checkout master --quiet" 2>/dev/null
+    if ! su "$aur_user" -c "git -C '$repo_path' pull --quiet" 2>/dev/null; then
+      {
+        eval_gettext "Failed to update AUR repository for \$name"
+        echo
+      } >&2
+      return 1
+    fi
+  else
+    # Clone new repository
+    if ! su "$aur_user" -c "git clone --quiet '$repo_url' '$repo_path'" 2>/dev/null; then
+      # Quietly skip if package does not exist in AUR
+      return 1
+    fi
+  fi
+
+  # Check for PKGBUILD since AUR can clone empty repos for non-existent packages
+  if [[ ! -f "$repo_path/PKGBUILD" ]]; then
+    rm -rf "$repo_path"
+    return 1
+  fi
+
+  # Extract commit hash-version pairs using logic similar to search_git()
+  pairs=$(git -C "$repo_path" log -p --oneline --format="GIT: %h" PKGBUILD | grep -e 'GIT:.*' -e '+pkgver' | grep -Pzo 'GIT: .*\n\+pkgver=.*\n' | sed 's/GIT: \|+pkgver=//' | tr -d '\0')
+
+  # shellcheck disable=SC2086
+  echo "$repo_path/$name" $pairs | awk '{for(i=2;i<NF;i+=2) printf "%s-%s-%s-any.aurpkg.tar.gz\n", $1, $(i+1), $i}' | sort -V
 }
 
 search_ala() {
@@ -292,9 +337,12 @@ output_package() {
   fi
 
   # Remote or local file
-  if [[ $path =~ ^/ && ! ($path =~ gitpkg) ]]; then
+  if [[ $path =~ ^/ && ! ($path =~ (git|aur)pkg) ]]; then
     location="$(dirname "$path")"
     timestamp=$(stat -c '%y' "$path" | cut -d' ' -f1)
+  elif [[ $path =~ aurpkg ]]; then
+    location="AUR"
+    timestamp=
   else
     location="$(gettext 'remote')"
     timestamp=
@@ -327,7 +375,7 @@ extract_version_parts() {
     s|^.\{'${#pkgname}'\}-\?||;
 
     # Strip package extension
-    s|\.\(git\)\?pkg\(\.tar\)\?\(\.[a-z0-9A-Z]\+\)\?$||;
+    s|\.\(git\|aur\)\?pkg\(\.tar\)\?\(\.[a-z0-9A-Z]\+\)\?$||;
 
     # (epoch:)?version(-release)?(-arch)? -> epoch,version,release,arch
     s|\(\([^:]*\):\)\?\([^-]*\)\(-\([^-]*\)\)\?\(-\(.*\)\)\?|\2,\3,\5,\7|;
@@ -357,6 +405,11 @@ process_term() {
   # this is already sorted
   if ((DOWNGRADE_FROM_GIT)); then
     candidates=($(search_git "$name" | filter_packages "$name" "$operator" "$version") "${candidates[@]}")
+  fi
+
+  # AUR results are already sorted
+  if ((DOWNGRADE_FROM_AUR)); then
+    candidates=($(search_aur "$name" | filter_packages "$name" "$operator" "$version") "${candidates[@]}")
   fi
 
   if (("${#candidates[@]}" == 0)); then
@@ -498,10 +551,12 @@ parse_options() {
       --ala-only)
         DOWNGRADE_FROM_ALA=1
         DOWNGRADE_FROM_CACHE=0
+        DOWNGRADE_FROM_AUR=0
         ;;
       --cached-only)
         DOWNGRADE_FROM_ALA=0
         DOWNGRADE_FROM_CACHE=1
+        DOWNGRADE_FROM_AUR=0
         ;;
       --ignore)
         if [[ -n "$2" && "$2" =~ ^(prompt|always|never)$ ]]; then
@@ -531,6 +586,28 @@ parse_options() {
         ;;
       --prefer-cache)
         DOWNGRADE_PREFER_CACHE=1
+        ;;
+      --no-aur)
+        DOWNGRADE_FROM_AUR=0
+        ;;
+      --aur-only)
+        DOWNGRADE_FROM_AUR=1
+        DOWNGRADE_FROM_ALA=0
+        DOWNGRADE_FROM_CACHE=0
+        DOWNGRADE_FROM_GIT=0
+        ;;
+      --aur-cache)
+        if [[ -n "$2" ]]; then
+          shift
+          DOWNGRADE_AUR_CACHE="$1"
+        else
+          {
+            gettext "Missing --aur-cache argument"
+            echo
+            usage
+          } >&2
+          exit 1
+        fi
         ;;
       --)
         shift
@@ -567,12 +644,12 @@ parse_options() {
 
 build_pkg() {
   local item="$1" path commit_hash build_failed versionreg hashreg gitpkgreg
-  if [[ "$item" =~ .*gitpkg.tar.gz ]]; then
+  if [[ "$item" =~ .*(git|aur)pkg.tar.gz ]]; then
     # version: 2025.11.12.r15.g0eed3fe
     versionreg="([a-zA-Z0-9]+\.?)*"
     hashreg='[a-z0-9]{6,}'
     #hash_or_minor="-([0-9]+|[a-z0-9]{6,})" # leaving this as a note, only hash should appear tho
-    gitpkgreg="(.*)-$versionreg-($hashreg)-(any|$DOWNGRADE_ARCH).gitpkg.tar.gz"
+    gitpkgreg="(.*)-$versionreg-($hashreg)-(any|$DOWNGRADE_ARCH).(git|aur)pkg.tar.gz"
     path=$(dirname "$item")
     commit_hash=$(sed -r "s/$gitpkgreg/\3/" <<<"$item")
 
@@ -606,7 +683,7 @@ cli() {
 
   # Proceed with rest of workflow
   main "${terms[@]}"
-  if ((DOWNGRADE_FROM_GIT)); then
+  if ((DOWNGRADE_FROM_GIT)) || ((DOWNGRADE_FROM_AUR)); then
     for item in "${to_install[@]}"; do
       build_pkg "$item"
     done
@@ -633,6 +710,8 @@ DOWNGRADE_IGNORE="prompt"
 DOWNGRADE_TO_LATEST=0
 DOWNGRADE_TO_OLDEST=0
 DOWNGRADE_PREFER_CACHE=0
+DOWNGRADE_FROM_AUR=1
+DOWNGRADE_AUR_CACHE="$(eval echo ~"${SUDO_USER:-$USER}")/.cache/downgrade/aur"
 
 # Main code execution
 if ((!DOWNGRADE_LIB)); then

@@ -19,6 +19,8 @@ PACMAN_CONF=$(mktemp)
 export PACMAN_CONF
 export DOWNGRADE_FROM_ALA=0
 export DOWNGRADE_FROM_CACHE=0
+export DOWNGRADE_FROM_AUR=0
+export DOWNGRADE_AUR_CACHE="/tmp/downgrade-test-aur-$$"
 export DOWNGRADE_CONF="$SRCDIR/test/conf/downgrade_test.conf"
 export PACIGNORE_DEFAULT_CHECK=1
 

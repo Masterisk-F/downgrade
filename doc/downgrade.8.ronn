@@ -109,6 +109,16 @@ on the ALA.
     ala. Unlike `--cached-only`, `--prefer-cache` does query ala if no package
     could be matched in cache.
 
+  * `--no-aur`:
+    Disable AUR search. By default, downgrade searches AUR git history for
+    available package versions.
+
+  * `--aur-only`:
+    Only use AUR as source. Disables local cache, ALA, and local git search.
+
+  * `--aur-cache`=<PATH>:
+    Directory to cache AUR git clones, defaults to _~/.cache/downgrade/aur_.
+
   * `--version`:
     Show downgrade version.
 
